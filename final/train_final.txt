@@ -1,0 +1,147 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import random_split, DataLoader
+from torchvision import datasets, transforms
+import pathlib
+from torch.cuda.amp import GradScaler, autocast
+import time
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+training_dir = pathlib.Path('/kaggle/input/radar-signal-classification/training_set')
+
+# 👉 Augmentation mới (thêm RandomRotation)
+transform = transforms.Compose([
+    transforms.Resize((128, 128)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(degrees=15),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
+
+full_dataset = datasets.ImageFolder(root=str(training_dir), transform=transform)
+train_size = int(0.8 * len(full_dataset))
+val_size = len(full_dataset) - train_size
+train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+
+class_names = full_dataset.classes
+num_classes = len(class_names)
+
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, pin_memory=True, num_workers=4)
+val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, pin_memory=True, num_workers=4)
+
+print(f"Classes: {class_names}")
+print(f"Training samples: {train_size}, Validation samples: {val_size}")
+
+# 👉 Model mới (tăng nhẹ cấu trúc, thêm 1 Conv)
+class OptimizedCNNv6_Light_Upgraded(nn.Module):
+    def __init__(self, num_classes=8):
+        super(OptimizedCNNv6_Light_Upgraded, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(64, 96, kernel_size=3, padding=1),
+            nn.BatchNorm2d(96),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(96, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+
+            nn.Conv2d(128, 160, kernel_size=3, padding=1),
+            nn.BatchNorm2d(160),
+            nn.ReLU(),
+
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(160, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return F.log_softmax(x, dim=1)
+
+model = OptimizedCNNv6_Light_Upgraded(num_classes=num_classes).to(device)
+
+total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"🔢 Total trainable parameters: {total_params}")
+
+# 👉 Loss: có label smoothing
+criterion = nn.CrossEntropyLoss(label_smoothing=0.05).to(device)
+optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=80)
+scaler = GradScaler()
+
+def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epochs=50):
+    best_val_acc = 0.0
+    for epoch in range(epochs):
+        start_time = time.time()
+        model.train()
+        correct, total = 0, 0
+
+        for images, labels in train_loader:
+            images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+            optimizer.zero_grad()
+            with autocast():
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            _, predicted = torch.max(outputs, 1)
+            correct += (predicted == labels).sum().item()
+            total += labels.size(0)
+
+        train_acc = correct / total
+
+        model.eval()
+        correct, total = 0, 0
+        with torch.no_grad():
+            with autocast():
+                for images, labels in val_loader:
+                    images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+                    outputs = model(images)
+                    _, predicted = torch.max(outputs, 1)
+                    correct += (predicted == labels).sum().item()
+                    total += labels.size(0)
+
+        val_acc = correct / total
+        scheduler.step()
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), "best_model.pt")
+
+        epoch_time = time.time() - start_time
+        print(f"Epoch {epoch+1:2d} | Train Acc: {train_acc*100:.2f}% | Val Acc: {val_acc*100:.2f}% | Time: {epoch_time:.2f}s | LR: {scheduler.get_last_lr()[0]:.6f}")
+
+    return model
+
+torch.cuda.empty_cache()
+model = train(model, train_loader, val_loader, criterion, optimizer, scheduler, epochs=50)
+
+example_input = torch.randn(1, 3, 128, 128).to(device)
+traced_model = torch.jit.trace(model, example_input)
+traced_model.save("22119129.pt")
+print("✅ Model saved as 22119129.pt")
+
+torch.cuda.empty_cache()
